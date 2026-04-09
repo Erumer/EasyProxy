@@ -29,11 +29,14 @@ class DLStreamsExtractor:
         self.session = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self.proxies = proxies or []
-        self._verified_channels: dict[str, float] = {}
-        self._browser_key_cache: dict[str, tuple[bytes, float]] = {}
-        self._browser_manifest_cache: dict[str, tuple[str, float]] = {}
+        self._browser_key_cache: dict[str, bytes] = {}
+        self._browser_manifest_cache: dict[str, str] = {}
         self._browser_failure_cache: dict[str, float] = {}
         self._browser_channel_locks: dict[str, asyncio.Lock] = {}
+        self._last_working_player: dict[str, str] = {}
+        self._playwright = None
+        self._browser = None
+        self._browser_launch_lock = asyncio.Lock()
 
     def _get_browser_lock(self, channel_key: str) -> asyncio.Lock:
         lock = self._browser_channel_locks.get(channel_key)
@@ -51,6 +54,42 @@ class DLStreamsExtractor:
 
     def _clear_browser_failure(self, channel_key: str) -> None:
         self._browser_failure_cache.pop(channel_key, None)
+
+    def _prioritize_player_urls(self, channel_id: str) -> list[str]:
+        players = self._build_player_urls(channel_id)
+        cached_player = self._last_working_player.get(channel_id)
+        if not cached_player:
+            return players
+        if cached_player not in players:
+            self._last_working_player.pop(channel_id, None)
+            return players
+        return [cached_player, *[p for p in players if p != cached_player]]
+
+    def _clear_channel_cache(self, channel_id: str) -> None:
+        channel_key = f"premium{channel_id}"
+        self._browser_manifest_cache.pop(channel_key, None)
+        self._last_working_player.pop(channel_id, None)
+        key_prefix = "https://sec.ai-hls.site/key/"
+        keys_to_remove = [k for k in self._browser_key_cache if k.startswith(key_prefix)]
+        for key in keys_to_remove:
+            self._browser_key_cache.pop(key, None)
+
+    async def _get_browser(self):
+        if self._browser:
+            return self._browser
+        async with self._browser_launch_lock:
+            if self._browser:
+                return self._browser
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
+            )
+        return self._browser
 
     def _get_header(self, name: str, default: str | None = None) -> str | None:
         for key, value in self.request_headers.items():
@@ -109,74 +148,17 @@ class DLStreamsExtractor:
         except Exception as exc:
             logger.debug("DLStreams warm-up failed for %s: %s", player_url, exc)
 
-    async def _browser_prime_verification(self, player_url: str, channel_key: str) -> bool:
-        cached_until = self._verified_channels.get(channel_key, 0)
-        now = time.time()
-        if cached_until > now:
-            logger.debug("DLStreams browser verification cache hit for %s", channel_key)
-            return True
-        if self._is_browser_cooldown_active(channel_key):
-            logger.info("DLStreams browser verification skipped during cooldown for %s", channel_key)
-            return False
-
-        logger.info("DLStreams browser verification starting for %s", channel_key)
-        try:
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    headless=False,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                    ],
-                )
-                context = await browser.new_context(
-                    user_agent=self.base_headers["User-Agent"],
-                    viewport={"width": 1366, "height": 768},
-                )
-                page = await context.new_page()
-                verify_seen = False
-
-                async def on_response(response):
-                    nonlocal verify_seen
-                    if response.url.startswith("https://sec.ai-hls.site/verify") and response.status == 200:
-                        verify_seen = True
-
-                page.on("response", on_response)
-                await page.goto(player_url, wait_until="domcontentloaded", timeout=20000)
-
-                deadline = time.time() + 20
-                while time.time() < deadline and not verify_seen:
-                    await page.wait_for_timeout(250)
-
-                await context.close()
-                await browser.close()
-
-                if verify_seen:
-                    self._verified_channels[channel_key] = now + 15 * 60
-                    self._clear_browser_failure(channel_key)
-                    logger.info("DLStreams browser verification succeeded for %s", channel_key)
-                    return True
-
-        except PlaywrightTimeoutError as exc:
-            logger.warning("DLStreams browser verification timed out for %s: %s", channel_key, exc)
-        except Exception as exc:
-            logger.warning("DLStreams browser verification failed for %s: %s", channel_key, exc)
-
-        self._mark_browser_failure(channel_key)
-        return False
-
     async def fetch_key_via_browser(self, key_url: str, original_url: str) -> bytes | None:
         cached = self._browser_key_cache.get(key_url)
-        now = time.time()
-        if cached and cached[1] > now:
-            return cached[0]
+        if cached:
+            return cached
 
         channel_id = self._extract_channel_id(original_url)
         await self._capture_browser_session_state(channel_id)
 
         cached = self._browser_key_cache.get(key_url)
-        if cached and cached[1] > time.time():
-            return cached[0]
+        if cached:
+            return cached
 
         channel_key = f"premium{channel_id}"
         player_url = self._build_player_urls(channel_id)[0]
@@ -186,27 +168,29 @@ class DLStreamsExtractor:
 
         logger.info("DLStreams browser key fetch starting for %s", key_url)
         try:
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    headless=False,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                    ],
+            browser = await self._get_browser()
+            context = await browser.new_context(
+                user_agent=self.base_headers["User-Agent"],
+                viewport={"width": 1366, "height": 768},
+            )
+            try:
+                await context.route(
+                    "**/*",
+                    lambda route, request: (
+                        route.abort()
+                        if request.resource_type in {"image", "font", "media"}
+                        else route.continue_()
+                    ),
                 )
-                context = await browser.new_context(
-                    user_agent=self.base_headers["User-Agent"],
-                    viewport={"width": 1366, "height": 768},
-                )
+            except Exception:
+                pass
+            try:
                 page = await context.new_page()
                 key_bytes: bytes | None = None
-                verify_seen = False
 
                 async def on_response(response):
-                    nonlocal key_bytes, verify_seen
+                    nonlocal key_bytes
                     try:
-                        if response.url.startswith("https://sec.ai-hls.site/verify") and response.status == 200:
-                            verify_seen = True
                         if response.url == key_url and response.status == 200 and key_bytes is None:
                             key_bytes = await response.body()
                     except Exception as exc:
@@ -215,20 +199,18 @@ class DLStreamsExtractor:
                 page.on("response", on_response)
                 await page.goto(player_url, wait_until="domcontentloaded", timeout=30000)
 
-                deadline = time.time() + 20
+                deadline = time.time() + 25
                 while time.time() < deadline and key_bytes is None:
                     await page.wait_for_timeout(250)
 
-                await context.close()
-                await browser.close()
-
-                if verify_seen:
-                    self._verified_channels[channel_key] = now + 15 * 60
                 if key_bytes:
-                    self._browser_key_cache[key_url] = (key_bytes, now + 30)
+                    self._browser_key_cache[key_url] = key_bytes
                     self._clear_browser_failure(channel_key)
                     logger.info("DLStreams browser key fetch succeeded for %s", key_url)
                     return key_bytes
+                self._clear_channel_cache(channel_id)
+            finally:
+                await context.close()
         except PlaywrightTimeoutError as exc:
             logger.warning("DLStreams browser key fetch timed out for %s: %s", key_url, exc)
         except Exception as exc:
@@ -241,21 +223,16 @@ class DLStreamsExtractor:
         channel_id = self._extract_channel_id(original_url)
         channel_key = f"premium{channel_id}"
         cached = self._browser_manifest_cache.get(channel_key)
-        now = time.time()
-        if cached and cached[1] > now:
-            return cached[0]
+        if cached:
+            return cached
 
         await self._capture_browser_session_state(channel_id)
-        cached = self._browser_manifest_cache.get(channel_key)
-        if cached and cached[1] > time.time():
-            return cached[0]
-        return None
+        return self._browser_manifest_cache.get(channel_key)
 
     async def _capture_browser_session_state(self, channel_id: str, player_url: str | None = None) -> None:
         channel_key = f"premium{channel_id}"
-        now = time.time()
         cached_manifest = self._browser_manifest_cache.get(channel_key)
-        if cached_manifest and cached_manifest[1] > now:
+        if cached_manifest:
             return
         if self._is_browser_cooldown_active(channel_key):
             logger.info("DLStreams browser session capture skipped during cooldown for %s", channel_key)
@@ -265,7 +242,7 @@ class DLStreamsExtractor:
         async with lock:
             now = time.time()
             cached_manifest = self._browser_manifest_cache.get(channel_key)
-            if cached_manifest and cached_manifest[1] > now:
+            if cached_manifest:
                 return
             if self._is_browser_cooldown_active(channel_key):
                 logger.info("DLStreams browser session capture skipped during cooldown for %s", channel_key)
@@ -274,23 +251,25 @@ class DLStreamsExtractor:
             resolved_player_url = player_url or self._build_player_urls(channel_id)[0]
             logger.info("DLStreams browser session capture starting for %s", channel_key)
             try:
-                async with async_playwright() as playwright:
-                    browser = await playwright.chromium.launch(
-                        headless=False,
-                        args=[
-                            "--disable-blink-features=AutomationControlled",
-                            "--no-sandbox",
-                            "--autoplay-policy=no-user-gesture-required",
-                        ],
+                browser = await self._get_browser()
+                context = await browser.new_context(
+                    user_agent=self.base_headers["User-Agent"],
+                    viewport={"width": 1366, "height": 768},
+                )
+                try:
+                    await context.route(
+                        "**/*",
+                        lambda route, request: (
+                            route.abort()
+                            if request.resource_type in {"image", "font", "media"}
+                            else route.continue_()
+                        ),
                     )
-                    context = await browser.new_context(
-                        user_agent=self.base_headers["User-Agent"],
-                        viewport={"width": 1366, "height": 768},
-                    )
+                except Exception:
+                    pass
+                try:
                     page = await context.new_page()
                     manifest_text: str | None = None
-                    key_ttl = now + 30
-                    manifest_ttl = now + 30
 
                     async def on_response(response):
                         nonlocal manifest_text
@@ -304,43 +283,37 @@ class DLStreamsExtractor:
                                 decoded = body.decode("utf-8", errors="ignore")
                                 if decoded.lstrip().startswith("#EXTM3U"):
                                     manifest_text = decoded
-                                    self._browser_manifest_cache[channel_key] = (
-                                        manifest_text,
-                                        manifest_ttl,
-                                    )
+                                    self._browser_manifest_cache[channel_key] = manifest_text
                             if "sec.ai-hls.site/key/" in response.url and response.status == 200:
                                 body = await response.body()
-                                self._browser_key_cache[response.url] = (body, key_ttl)
+                                self._browser_key_cache[response.url] = body
                         except Exception as exc:
                             logger.debug("DLStreams browser capture hook failed for %s: %s", response.url, exc)
 
                     context.on("response", on_response)
                     await page.goto(resolved_player_url, wait_until="domcontentloaded", timeout=30000)
 
-                    deadline = time.time() + 20
+                    deadline = time.time() + 25
                     while time.time() < deadline:
                         cached_manifest = self._browser_manifest_cache.get(channel_key)
-                        has_manifest = cached_manifest and cached_manifest[1] > time.time()
-                        has_key = any(
-                            key.startswith("https://sec.ai-hls.site/key/")
-                            and expiry > time.time()
-                            for key, (_, expiry) in self._browser_key_cache.items()
-                        )
+                        has_manifest = bool(cached_manifest)
+                        has_key = any(key.startswith("https://sec.ai-hls.site/key/") for key in self._browser_key_cache)
                         if has_manifest and has_key:
                             break
                         await page.wait_for_timeout(250)
 
-                    await context.close()
-                    await browser.close()
-
                     cached_manifest = self._browser_manifest_cache.get(channel_key)
-                    has_manifest = cached_manifest and cached_manifest[1] > time.time()
+                    has_manifest = bool(cached_manifest)
                     if has_manifest:
+                        self._last_working_player[channel_id] = resolved_player_url
                         self._clear_browser_failure(channel_key)
                     else:
+                        self._clear_channel_cache(channel_id)
                         self._mark_browser_failure(channel_key)
 
                     logger.info("DLStreams browser session capture completed for %s", channel_key)
+                finally:
+                    await context.close()
             except Exception as exc:
                 self._mark_browser_failure(channel_key)
                 logger.warning("DLStreams browser session capture failed for %s: %s", channel_key, exc)
@@ -369,13 +342,12 @@ class DLStreamsExtractor:
 
             channel_key = f"premium{channel_id}"
             session = await self._get_session()
-            player_urls = self._build_player_urls(channel_id)
+            player_urls = self._prioritize_player_urls(channel_id)
             for candidate in player_urls:
                 await self._prime_dlstreams_session(session, candidate)
-                await self._browser_prime_verification(candidate, channel_key)
                 await self._capture_browser_session_state(channel_id, candidate)
                 cached_manifest = self._browser_manifest_cache.get(channel_key)
-                if cached_manifest and cached_manifest[1] > time.time():
+                if cached_manifest:
                     break
 
             captured_manifest = await self.get_manifest_via_browser(url)
@@ -433,3 +405,9 @@ class DLStreamsExtractor:
         if self.session and not self.session.closed:
             await self.session.close()
             self.session = None
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
