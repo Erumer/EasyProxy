@@ -34,6 +34,13 @@ except ImportError:
     HAS_CURL_CFFI = False
     CurlAsyncSession = None
 
+try:
+    from playwright.async_api import async_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    async_playwright = None
+
 from config import (
     GLOBAL_PROXIES,
     TRANSPORT_ROUTES,
@@ -3846,6 +3853,125 @@ class HLSProxy:
         except Exception as e:
             logger.error(f"❌ Error fetching IP: {e}")
             return web.Response(text=str(e), status=500)
+
+    async def handle_debug_fetch(self, request):
+        """Diagnostic endpoint to compare aiohttp/curl_cffi/playwright fetch behavior."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+
+        target_url = request.query.get("url") or request.query.get("d")
+        if not target_url:
+            return web.Response(status=400, text="Missing 'url' or 'd' parameter")
+
+        headers = {}
+        for param_name, param_value in request.query.items():
+            if param_name.startswith("h_"):
+                headers[param_name[2:]] = param_value
+
+        use_proxy = request.query.get("use_proxy") == "1"
+        proxy_url = get_proxy_for_url(target_url, TRANSPORT_ROUTES, GLOBAL_PROXIES) if use_proxy else None
+        disable_ssl = get_ssl_setting_for_url(target_url, TRANSPORT_ROUTES)
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        def summarize_text(value: str, limit: int = 200) -> str:
+            if value is None:
+                return ""
+            if len(value) <= limit:
+                return value
+            return value[:limit] + "..."
+
+        async def run_aiohttp_probe():
+            result = {"ok": False, "engine": "aiohttp", "proxy": proxy_url or ""}
+            try:
+                connector = get_connector_for_proxy(proxy_url) if proxy_url else TCPConnector(limit=0, ssl=False if disable_ssl else None)
+                async with ClientSession(timeout=timeout, connector=connector, cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
+                    async with session.get(target_url, headers=headers, ssl=not disable_ssl, allow_redirects=True) as resp:
+                        body = await resp.text(errors="replace")
+                        cookies = session.cookie_jar.filter_cookies(yarl.URL(str(resp.url)))
+                        result.update({
+                            "ok": resp.status in (200, 206),
+                            "status": resp.status,
+                            "final_url": str(resp.url),
+                            "content_type": resp.headers.get("content-type", ""),
+                            "body_snippet": summarize_text(body),
+                            "cookie_names": sorted(list(cookies.keys())),
+                        })
+            except Exception as e:
+                result["error"] = str(e)
+            return result
+
+        async def run_curl_probe():
+            result = {"ok": False, "engine": "curl_cffi", "proxy": proxy_url or ""}
+            if not HAS_CURL_CFFI:
+                result["error"] = "curl_cffi not installed"
+                return result
+            try:
+                async with CurlAsyncSession(impersonate="chrome124") as session:
+                    curl_headers = dict(headers)
+                    curl_proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+                    resp = await session.get(
+                        target_url,
+                        headers=curl_headers,
+                        proxies=curl_proxies,
+                        verify=not disable_ssl,
+                        timeout=30,
+                        allow_redirects=True,
+                    )
+                    result.update({
+                        "ok": resp.status_code in (200, 206),
+                        "status": resp.status_code,
+                        "final_url": str(resp.url),
+                        "content_type": resp.headers.get("content-type", ""),
+                        "body_snippet": summarize_text(resp.text),
+                        "cookie_names": sorted(list(resp.cookies.get_dict().keys())),
+                    })
+            except Exception as e:
+                result["error"] = str(e)
+            return result
+
+        async def run_playwright_probe():
+            result = {"ok": False, "engine": "playwright", "proxy": proxy_url or ""}
+            if not HAS_PLAYWRIGHT:
+                result["error"] = "playwright not installed"
+                return result
+            try:
+                launch_kwargs = {"headless": True}
+                if proxy_url:
+                    launch_kwargs["proxy"] = {"server": proxy_url}
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(**launch_kwargs)
+                    context = await browser.new_context(ignore_https_errors=disable_ssl, extra_http_headers=headers)
+                    page = await context.new_page()
+                    response = await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    body = await page.content()
+                    cookies = await context.cookies()
+                    result.update({
+                        "ok": bool(response and response.status in (200, 206)),
+                        "status": response.status if response else None,
+                        "final_url": page.url,
+                        "content_type": response.headers.get("content-type", "") if response else "",
+                        "body_snippet": summarize_text(body),
+                        "cookie_names": sorted([c["name"] for c in cookies]),
+                    })
+                    await context.close()
+                    await browser.close()
+            except Exception as e:
+                result["error"] = str(e)
+            return result
+
+        results = await asyncio.gather(
+            run_aiohttp_probe(),
+            run_curl_probe(),
+            run_playwright_probe(),
+        )
+
+        return web.json_response({
+            "url": target_url,
+            "headers": headers,
+            "use_proxy": use_proxy,
+            "proxy_url": proxy_url,
+            "results": results,
+        })
 
     async def cleanup(self):
         """Pulizia delle risorse"""
