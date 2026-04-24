@@ -48,6 +48,7 @@ class DoodStreamExtractor:
 
     _free_proxy_lock = threading.Lock()
     _free_proxy_cache = {"expires_at": 0.0, "proxies": []}
+    _free_proxy_cursor = 0
 
     def __init__(self, request_headers: dict = None, proxies: list = None):
         self.request_headers = request_headers or {}
@@ -212,6 +213,17 @@ class DoodStreamExtractor:
             }
             return list(good)
 
+    def _get_next_auto_proxy_sequence(self, embed_url: str) -> list[str]:
+        proxies = self._get_auto_proxy_pool(embed_url)
+        if not proxies:
+            return []
+
+        with self.__class__._free_proxy_lock:
+            cursor = self.__class__._free_proxy_cursor % len(proxies)
+            self.__class__._free_proxy_cursor = (cursor + 1) % len(proxies)
+
+        return proxies[cursor:] + proxies[:cursor]
+
     async def _do_extract_with_proxy(self, embed_url: str, scraper_proxies: dict | None) -> dict | None:
         scraper = cloudscraper.create_scraper(delay=5)
         if scraper_proxies:
@@ -281,7 +293,7 @@ class DoodStreamExtractor:
             if result:
                 return result
 
-            for proxy_url in self._get_auto_proxy_pool(embed_url):
+            for proxy_url in self._get_next_auto_proxy_sequence(embed_url):
                 logger.info(f"DoodStream: retrying with auto proxy {proxy_url}")
                 result = await self._do_extract_with_proxy(
                     embed_url,
