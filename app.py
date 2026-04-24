@@ -22,6 +22,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
 )
 
+logger = logging.getLogger(__name__)
+
 # --- Logica di Avvio ---
 def create_app():
     """Crea e configura l'applicazione aiohttp."""
@@ -48,6 +50,9 @@ def create_app():
     
     # Registra le route
     app.router.add_get('/', proxy.handle_root)
+    app.router.add_get('/docs', proxy.handle_docs)
+    app.router.add_get('/redoc', proxy.handle_redoc)
+    app.router.add_get('/openapi.json', proxy.handle_openapi)
     app.router.add_get('/favicon.ico', proxy.handle_favicon) # ✅ Route Favicon
     
     # ✅ Route Static Files (con path assoluto e creazione automatica)
@@ -57,6 +62,8 @@ def create_app():
     app.router.add_static('/static', static_path)
     
     app.router.add_get('/builder', proxy.handle_builder)
+    app.router.add_get('/playlist/builder', proxy.handle_builder)
+    app.router.add_get('/url-generator', proxy.handle_url_generator)
     app.router.add_get('/info', proxy.handle_info_page)
     app.router.add_get('/api/info', proxy.handle_api_info)
     app.router.add_get('/key', proxy.handle_key_request)
@@ -68,11 +75,14 @@ def create_app():
     app.router.add_get('/extractor', proxy.handle_extractor_request)
     # ✅ NUOVO: Endpoint compatibilità MFP per estrazione
     app.router.add_get('/extractor/video', proxy.handle_extractor_request)
+    app.router.add_get('/extractor/video.m3u8', proxy.handle_extractor_request)
+    app.router.add_get('/extractor/video.mp4', proxy.handle_extractor_request)
     
     # ✅ NUOVO: Route per segmenti con estensioni corrette per compatibilità player
     app.router.add_get('/proxy/hls/segment.ts', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/segment.m4s', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/segment.mp4', proxy.handle_proxy_request)
+    app.router.add_get('/proxy/hls/segment.vtt', proxy.handle_proxy_request)
     
     app.router.add_get('/playlist', proxy.handle_playlist_request)
     app.router.add_get('/segment/{segment}', proxy.handle_ts_segment)
@@ -169,7 +179,6 @@ def create_app():
 
     # ✅ NUOVO: Endpoint per ottenere l'IP pubblico
     app.router.add_get('/proxy/ip', proxy.handle_proxy_ip)
-
     # Setup recording/DVR routes (only if enabled)
     if DVR_ENABLED:
         setup_recording_routes(app, recording_manager)
@@ -183,6 +192,7 @@ def create_app():
     
     async def on_startup(app):
         asyncio.create_task(ffmpeg_manager.cleanup_loop())
+        asyncio.create_task(proxy.start_tasks())
         if DVR_ENABLED:
             asyncio.create_task(recording_manager.cleanup_loop())
     app.on_startup.append(on_startup)
@@ -204,17 +214,17 @@ def main():
         # Silenzia il logger di asyncio per evitare spam di ConnectionResetError
         logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
-    print("🚀 Starting HLS Proxy Server...")
-    print(f"📡 Server available at: http://localhost:{PORT}")
-    print(f"📡 Or: http://server-ip:{PORT}")
-    print("🔗 Endpoints:")
-    print("   • / - Main page")
-    print("   • /builder - Web interface for playlist builder")
-    print("   • /info - Server information page")
-    print("   • /recordings - DVR/Recording interface")
-    print("   • /proxy/manifest.m3u8?url=<URL> - Main stream proxy")
-    print("   • /playlist?url=<definitions> - Playlist generator")
-    print("=" * 50)
+    logger.info("🚀 Starting HLS Proxy Server...")
+    logger.info("📡 Server available at: http://localhost:%s", PORT)
+    logger.info("📡 Or: http://server-ip:%s", PORT)
+    logger.debug("🔗 Endpoints:")
+    logger.debug("   • / - Main page")
+    logger.debug("   • /builder - Web interface for playlist builder")
+    logger.debug("   • /info - Server information page")
+    logger.debug("   • /recordings - DVR/Recording interface")
+    logger.debug("   • /proxy/manifest.m3u8?url=<URL> - Main stream proxy")
+    logger.debug("   • /playlist?url=<definitions> - Playlist generator")
+    logger.debug("%s", "=" * 50)
     
     web.run_app(
         app, # Usa l'istanza aiohttp originale per il runner integrato

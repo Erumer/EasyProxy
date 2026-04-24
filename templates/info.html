@@ -731,6 +731,74 @@
             color: #f87171;
             border: 1px solid rgba(239, 68, 68, 0.3);
         }
+
+        .version-badge {
+            background: var(--accent-gradient);
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+            margin-left: 8px;
+            color: white;
+        }
+
+        .version-info {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            background: rgba(255, 255, 255, 0.05);
+            padding: 2px 10px;
+            border-radius: 20px;
+            border: 1px solid var(--border-primary);
+        }
+
+        .version-latest {
+            color: var(--status-online);
+            font-weight: 600;
+            transition: var(--transition-normal);
+        }
+
+        .version-latest.outdated {
+            color: var(--status-error);
+            animation: versionPulse 2s infinite;
+            text-shadow: 0 0 5px rgba(239, 68, 68, 0.4);
+        }
+
+        .warp-badge {
+            margin-left: 6px;
+            padding: 2px 10px;
+            border-radius: 20px;
+            background: rgba(37, 99, 235, 0.1);
+            color: #3b82f6;
+            font-weight: 700;
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border: 1px solid rgba(37, 99, 235, 0.2);
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .warp-badge::before {
+            content: "";
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        @keyframes versionPulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.7; transform: scale(1.05); }
+            100% { opacity: 1; transform: scale(1); }
+        }
     </style>
 </head>
 
@@ -741,6 +809,12 @@
             <div class="status-banner">
                 <div class="status-indicator"></div>
                 <span>Server Operational</span>
+                <span class="version-badge">{{VERSION_MODE}}</span>
+                <div class="version-info">
+                    <span>v{{APP_VERSION}}</span>
+                    <span class="version-latest {{VERSION_STATUS_CLASS}}">(Latest: {{LATEST_VERSION}})</span>
+                    <div class="warp-badge">WARP: {{WARP_STATUS}}</div>
+                </div>
             </div>
         </div>
 
@@ -982,7 +1056,7 @@
                 <div class="endpoint-card">
                     <div class="endpoint-header">
                         <span class="endpoint-method">GET</span>
-                        <code class="endpoint-path">/extractor/video?url=&lt;URL&gt;</code>
+                        <code class="endpoint-path">/extractor/video?d=&lt;URL&gt;</code>
                     </div>
                     <p class="endpoint-description">
                         Advanced Extraction API.
@@ -1115,19 +1189,23 @@
                     </h3>
                     <div class="example-block">
                         1. JSON Response (default):<br>
-                        /extractor/video?url=https://vavoo.to/channel/123
+                        /extractor/video?d=https://vavoo.to/channel/123
                     </div>
                     <div class="example-block">
                         2. Immediate redirect:<br>
-                        /extractor/video?url=https://daddylive.mp/stream.php&redirect_stream=true
+                        /extractor/video?d=https://daddylive.mp/stream.php&redirect_stream=true
                     </div>
                     <div class="example-block">
                         3. With manual host:<br>
-                        /extractor/video?host=vavoo&url=https://custom-link.com/123
+                        /extractor/video.m3u8?host=vavoo&d=https://custom-link.com/123
+                    </div>
+                    <div class="example-block">
+                        3b. Direct MP4 host:<br>
+                        /extractor/video.mp4?host=mixdrop&d=https://mixdrop.co/e/ABC123XYZ
                     </div>
                     <div class="example-block">
                         4. URL Base64:<br>
-                        /extractor/video?url=aHR0cHM6Ly9leGFtcGxlLmNvbS92aWRlbw==
+                        /extractor/video?d=aHR0cHM6Ly9leGFtcGxlLmNvbS92aWRlbw==
                     </div>
 
                     <h3
